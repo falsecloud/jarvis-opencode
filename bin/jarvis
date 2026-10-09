@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""J.A.R.V.I.S. voice loop for opencode.
+
+mic -> (wake word "hey jarvis" | push-to-talk) -> faster-whisper -> `opencode run --agent jarvis` -> TTS
+"""
+import argparse, datetime, os, re, shutil, subprocess, sys, tempfile, time
+import numpy as np
+import sounddevice as sd
+
+SR, CHUNK = 16000, 1280  # 16 kHz, 80 ms blocks (what openWakeWord expects)
+AGENT = os.environ.get("JARVIS_AGENT", "jarvis")
+OC_MODEL = os.environ.get("JARVIS_MODEL", "")            # e.g. anthropic/claude-sonnet-4-5
+WHISPER = os.environ.get("JARVIS_WHISPER", "base.en")    # tiny.en / base.en / small.en
+VOICE = os.environ.get("JARVIS_VOICE", "en-GB-RyanNeural")
+PIPER_MODEL = os.environ.get("JARVIS_PIPER_MODEL", "")   # path to .onnx for offline voice
+MAX_SPOKEN = 450
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+COL = dict(dim="\033[2m", cyan="\033[36m", yellow="\033[33m", green="\033[32m", red="\033[31m", off="\033[0m")
+
+
+def say_status(msg, color="cyan"):
+    print(f"{COL[color]}{msg}{COL['off']}", flush=True)
+
+
+# ---------------------------------------------------------------- audio in
+def rms(x):
+    return float(np.sqrt(np.mean(x.astype(np.float32) ** 2)))
+
+
+def calibrate():
+    say_status("calibrating microphone...", "dim")
+    with sd.InputStream(samplerate=SR, channels=1, dtype="int16", blocksize=CHUNK) as s:
+        levels = [rms(s.read(CHUNK)[0][:, 0]) for _ in range(12)]
+    return max(float(np.mean(levels[2:])) * 2.5, 300.0)
+
+
+def record_utterance(stream, thresh):
+    frames, started, silent, t0 = [], False, 0, time.time()
+    while True:
+        block = stream.read(CHUNK)[0][:, 0].copy()
+        frames.append(block)
+        if rms(block) > thresh:
+            started, silent = True, 0
+        elif started:
+            silent += 1
+        if started and silent >= 14:          # ~1.1 s of quiet ends the utterance
+            break
+        if not started and time.time() - t0 > 6:
+            return None                       # nobody spoke
+        if time.time() - t0 > 25:
+            break
+    return np.concatenate(frames).astype(np.float32) / 32768.0
+
+
+def wait_for_wake(stream, oww):
+    if hasattr(oww, "reset"):
+        oww.reset()
+    while True:
+        scores = oww.predict(stream.read(CHUNK)[0][:, 0])
+        if any(v > 0.5 for v in scores.values()):
+            return
+
+
+def listen(mode, oww, thresh):
+    if mode == "ptt":
+        input(f"{COL['dim']}[Enter] to talk...{COL['off']}")
+    with sd.InputStream(samplerate=SR, channels=1, dtype="int16", blocksize=CHUNK) as s:
+        if mode == "wake":
+            say_status("waiting for 'hey jarvis'...", "dim")
+            wait_for_wake(s, oww)
+        say_status("listening...", "green")
+        return record_utterance(s, thresh)
+
+
+def transcribe(model, audio):
+    segs, _ = model.transcribe(audio, language="en", beam_size=1, vad_filter=True)
+    text = " ".join(s.text.strip() for s in segs).strip()
+    return re.sub(r"^(hey\s+)?jarvis[,.!\s]*", "", text, flags=re.I).strip()
+
+
+# ---------------------------------------------------------------- opencode
+def ask(prompt, cont):
+    cmd = ["opencode", "run", "--agent", AGENT]
+    if OC_MODEL:
+        cmd += ["--model", OC_MODEL]
+    if cont:
+        cmd.append("--continue")
+    cmd.append(prompt)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = ANSI.sub("", r.stdout).strip()
+    if not out:
+        out = "Something went wrong, sir. " + ANSI.sub("", r.stderr).strip()[:200]
+    return out
+
+
+# ---------------------------------------------------------------- audio out
+def spoken_version(text):
+    had_code = "```" in text
+    t = re.sub(r"```.*?```", " ", text, flags=re.S)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"https?://\S+", "link", t)
+    t = re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", t, flags=re.M)
+    t = re.sub(r"[*_#>|]+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    out, truncated = "", False
+    for s in re.split(r"(?<=[.!?])\s+", t):
+        if len(out) + len(s) > MAX_SPOKEN:
+            truncated = True
+            break
+        out += s + " "
+    if (had_code or truncated) and out:
+        out += "The details are on screen, sir."
+    return out.strip()
+
+
+def play(path):
+    for cmd in (["mpv", "--no-video", "--really-quiet"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"],
+                ["paplay"], ["aplay", "-q"]):
+        if shutil.which(cmd[0]):
+            subprocess.run(cmd + [path])
+            return
+    say_status("no audio player found (install mpv)", "red")
+
+
+def speak(text):
+    text = spoken_version(text)
+    if not text:
+        return
+    say_status("speaking... (Ctrl+C to skip)", "yellow")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            if shutil.which("edge-tts") and not PIPER_MODEL:
+                f = os.path.join(d, "out.mp3")
+                r = subprocess.run(["edge-tts", "--voice", VOICE, "--rate=+8%", "--text", text, "--write-media", f],
+                                   capture_output=True)
+                if r.returncode == 0:
+                    return play(f)
+            if shutil.which("piper") and PIPER_MODEL:
+                f = os.path.join(d, "out.wav")
+                subprocess.run(["piper", "-m", PIPER_MODEL, "-f", f], input=text.encode(), capture_output=True)
+                return play(f)
+            if shutil.which("espeak-ng"):
+                subprocess.run(["espeak-ng", "-v", "en-gb", "-s", "170", "-p", "35", text])
+            else:
+                say_status("no TTS engine found", "red")
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ptt", action="store_true", help="push-to-talk instead of wake word")
+    ap.add_argument("--fresh", action="store_true", help="don't continue the previous opencode session")
+    ap.add_argument("--threshold", type=float, help="manual mic threshold (RMS)")
+    args = ap.parse_args()
+
+    print("\033]2;J.A.R.V.I.S.\007", end="")  # kitty window title
+    from faster_whisper import WhisperModel
+    say_status(f"loading speech model ({WHISPER})...", "dim")
+    stt = WhisperModel(WHISPER, device="cpu", compute_type="int8")
+
+    mode, oww = "ptt", None
+    if not args.ptt:
+        try:
+            from openwakeword.model import Model
+            oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+            mode = "wake"
+        except Exception as e:
+            say_status(f"wake word unavailable ({e}); using push-to-talk", "yellow")
+
+    thresh = args.threshold or calibrate()
+    hour = datetime.datetime.now().hour
+    greet = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+    msg = f"{greet}, sir. All systems are online."
+    say_status(f"JARVIS: {msg}", "cyan")
+    speak(msg)
+
+    cont = not args.fresh and False  # first turn starts a new session unless you pass --continue yourself
+    while True:
+        try:
+            audio = listen(mode, oww, thresh)
+            if audio is None:
+                continue
+            text = transcribe(stt, audio)
+            if len(text) < 2:
+                continue
+            say_status(f"you: {text}", "yellow")
+            if re.search(r"\b(shut down|goodbye|that'?ll be all|power down)\b", text, re.I):
+                speak("Very good, sir. Powering down.")
+                break
+            say_status("thinking...", "cyan")
+            reply = ask(text, cont)
+            cont = True
+            print(f"\n{reply}\n")
+            speak(reply)
+        except KeyboardInterrupt:
+            print()
+            break
+
+
+if __name__ == "__main__":
+    main()
